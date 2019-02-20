@@ -23,3 +23,6 @@ It can be multiple such files tuned to different Tasks with differents sets of p
 
 In the future this script might also allow to use a certain combination of owner and group (for example root:sys) as a poor man system attribute (Unix does not have system attribute for files and directories). 
 
+For the documentation see http://www.softpanorama.org/Utilities/Saferm/index.shtml
+
+For the set of ideas behind the utility see http://www.softpanorama.org/Admin/Horror_stories/creative_uses_of_rm.shtml
