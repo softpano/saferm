@@ -18,4 +18,8 @@ After that you can edit it to adapt to your system (default system blacklist is 
 # User (or private)  configuration file
 
 The second is user blacklist lives in ~/Saferm/saferm.conf  and can add to system blacklist directories and files that are important for you. 
+
+It can be multiple such files tuned to different Tasks with differents sets of protectionr egex. The one that is used can be symlinked to the ~/Saferm/saferm.conf
+
 In the future this script might also allow to use a certain combination of owner and group (for example root:sys) as a poor man system attribute (Unix does not have system attribute for files and directories). 
+
