@@ -1,7 +1,5 @@
 # saferm
-Wrapper for rm that helps to prevent accidental deletion of vital files
-
-Perl wrapper for rm which prevents accidental deletions using a set of regular expressions. Initially was based on safe-rm - https://launchpad.net/safe-rm
+Perl wrapper for rm command that helps to prevent accidental deletion of vital files
 
 Currently installation consists of copying the  script into one of the directories on your path an creation of the alias to this place. For example
 
@@ -9,7 +7,7 @@ Currently installation consists of copying the  script into one of the directori
 
 The program uses two blacklists (system-wide and user-specific), each of which consists of set of "typed" (see acceptable types below) Perl regular expressions.
 
-Defaults are /etc/saferm.conf and ~/.saferm.conf . They can be overwritten via env. variables saferm_conf and saferm_private_conf, correspondingly. 
+Defaults are /etc/saferm.conf and ~/Saferm/saferm.conf . They can be overwritten via env. variables saferm_global_conf and saferm_private_conf, correspondingly. 
 
 # System configuration file
 
@@ -19,5 +17,5 @@ After that you can edit it to adapt to your system (default system blacklist is 
 
 # User (or private)  configuration file
 
-The second is user blacklist lives in ~/.saferm  and can add to system blacklist directories and files that are important for you. 
+The second is user blacklist lives in ~/Saferm/saferm.conf  and can add to system blacklist directories and files that are important for you. 
 In the future this script might also allow to use a certain combination of owner and group (for example root:sys) as a poor man system attribute (Unix does not have system attribute for files and directories). 
