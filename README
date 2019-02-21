@@ -2,7 +2,7 @@ saferm -- Perl wrapper for rm command that helps to prevent accidental deletion 
 
 Copyright Nikolai Bezrounkov, 2019
 
-Released uder Perl Artisitic License,  or MIT license. 
+Released uder Perl Artisitic License,  or MIT license.
 
 The key idea is to use a set of Perl regular expression to detect "creative uses of rm" -- situation when system files or important user files are accidentlaly deleted.
 
@@ -21,12 +21,22 @@ For more information see https://github.com/softpano/saferm/wiki
 == Installation ==
 
 This utility depends on Perl and tree. Please note that in RHEL 7 minimal install the utility tree is not included and needs to be installed separatly via yum install tree
+Installation can be performed ither manually or using provided install script
+
+1. Using install script
+   a. local install
+      ./saferm_install.sh ~/bin/ ~/.bashrc
+   b. system install (defalts for the script are system install, which should be run as root)
+      ./saferm_install.sh
+
+2. Manual install Currently installation consists of copying the script into one of the directories on your path an creation of the alias to this place.
+   For example
+
+   alias rm='/usr/bin/saferm'
 
 
-Currently installation consists of copying the script into one of the directories on your path an creation of the alias to this place. For example
 
-alias rm='/usr/bin/saferm'
-
+=== System configuration file ===
 
 The program uses two blacklists (system-wide and user-specific), each of which consists of set of "typed"  Perl regular expressions.
 
@@ -52,26 +62,18 @@ and
 
 correspondingly.
 
-
-=== System configuration file ===
-
-
-The first is so called system-wide blacklist which is located in /etc/saferm.conf.
-
-
-If it does not exist on the first invocation it will be created from the default blacklist in the script.
-
+system-wide blacklist /etc/saferm.conf is created by the utility automatically when it is run the first time as root user.
 
 After that you can edit it to adapt to your system (default system blacklist is Red Hat oriented)
 
 
 === User (or private) configuration file ===
 
-
 The second is user blacklist lives in ~/Saferm/saferm.conf  and can add to system blacklist directories and files that are important for you.
 
-
 It can be multiple such files tuned to different Tasks with different sets of protection regex. The one that is used can be symlinked to the ~/Saferm/saferm.conf
+
+=== Additional information ===
 
 For the documentation see http://www.softpanorama.org/Utilities/Saferm/index.shtml
 
