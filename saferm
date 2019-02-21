@@ -1,0 +1,716 @@
+#!/usr/bin/perl
+#:: saferm -- Envelope for rm command which provides safety checks for file deletion from command line
+#:: by Nikolai Bezroukov
+#:: Released under Perl Artistic License or MIT license (your choice)
+#::
+#:: PURPOSE:
+#::           Default set of protection regex (perl regular expressions) is provided.
+#::           If run as root on first invocation it is written to /etc/saferm.conf (system configuration), if no such file exists.
+#::           Default /etc/saferm.conf is written for RHEL 6/7 and needs to adapted to other flavors of Linux
+#::           The command performs additional "sanity" checks if option -r (or -R)  is specified.
+#::           For example,  only one argument can be provided with such command and expansion of the argument should net contain '..'
+#::           Normally should be aliased to rm command, so that it is used only for interactive sessions. For example
+#::           alias rm='/usr/bin/rm'
+#::
+#::           for more information see
+#::
+#::DEPENDENCIES: Tree needs to be installed (it is not installed by default on minimal RHEL7). For example
+#::            yum install tree
+#::
+#:: OPTIONS:
+#::   --help -- this help. If you use saferm -v --help, the default set of regular expression will be listed too
+#::   -<number> -- allow to specify the upper limit for deleted files (the default is 100). For example
+#::                saferm -1000 /Data/Old_backup/*htm
+#::            NOTE: running saferm with the option -0 allows to use as purely diagnostic tool and  for debugging
+#::
+#::   All other options are passed to rm command unchanged.
+#::
+#:: CONFIGURATION:
+#::
+#:: The utility uses two configuration files:
+#::     /etc/saferm.conf        System configuration file (usually contains regex for protection of system directories). If absent defaults are used
+#::     ~/Saferm/saferm.conf    Private configuration file (usually contains regex to protect vital user directories)
+#::
+#:: The following types of regex are currently supported
+#::
+#::    a -- absolute protection using supplied prefix; type of object does not matter (for example, it can be either link or directory)
+#::    p -- prefix string (similar to "a" but fixed string full_matching is used). Like "a" applies to all types of objects.
+#::    d -- Protected only if full_match is a directory.
+#::    f -- protected only if the full_match is a file
+#::    l -- protected only if the full_match is a link
+#::
+#:: Those locations can be changed via environment variable saferm_global_config and saferm_local_config
+#::
+#:: This utility creates the list of files to be deleted and then Analise them one-by-one full_matching against a set of rules specified as Perl regex
+#::    -- If no rules are violated it generate and executes rm command with three additional options --one-filesystem, -I and -v
+#::    -- If recursive key is given only one argument is accepted for safety reasons. Also rm command is generated but not executed.
+#::
+#:: All operations are logged in ~/Saferm/Logs directory. Only last 24 entries are preserved.
+#--- Development History
+#
+#++ Ver   Date         Who       Modification
+#++ ====  ==========   ========  =========================
+#++ 1.00  2014/04/21   BEZROUN   Initial implementation of the idea of using Perl regex for protection from accidental deletions, inspired by safe-rm
+#++ 2.00  2019/01/17   BEZROUN   Rewrite with much better, compiler style diagnostics and extended set of internal checks
+#++ 2.10  2019/02/07   BEZROUN   Comments and empty lines are allowed in blacklists
+#++ 2.20  2019/02/15   BEZROUN   Limit on the number of deleted files introduced. Logic of processing symlinks improved.
+#++ 2.21  2019/02/16   BEZROUN   Local config file now is in ~/Saferm/saferm.conf
+#++ 2.22  2019/02/17   BEZROUN   Log is now written in ~/Saferm/Logs
+#++ 2.23  2019/02/18   BEZROUN   Sample of files to be deleted is now displayed, if the number if more then 7
+#++ 2.30  2019/02/18   BEZROUN   Type p -- prefix string was implemented
+#++ 2.31  2019/02/19   BEZROUN   Polishing  before publishing ;-)
+
+# ------------------------------------------ START --------------------------------------------
+
+#use v5.10;
+#use feature 'state';
+#use warnings;
+#use strict 'subs';
+use Cwd 'realpath';
+#use Getopt::Std;
+
+   $VERSION = '2.31';
+   $debug=0;
+   $SCRIPT_NAME='saferm';
+   $upper_limit=100;
+#
+#  Configurations (can be overwritten via enviromental variables )
+#
+
+   $Msglevel1=5; # level of messages in print
+   $Msglevel2=3; # level of message in log (only S,E, and W messages )
+   $TopSeverity=0;
+   @ErCountParsedRecordser=(0,0,0,0,0);
+
+   $HOME=$ENV{'HOME'};
+   $BASE=$HOME.'/Saferm';
+   $PWD= $ENV{'PWD'};
+   chomp($HOSTNAME=`hostname -s`);
+   $LOG_DIR="$BASE/Logs"; # used for opening SYSLOG
+   mkdirs($LOG_DIR);
+
+   $PRIVATE_CONFIG="$BASE/saferm.conf";
+   $SYS_CONFIG = '/etc/saferm.conf';
+
+   banner(24); # parameter is max number of log files to retain in BASE directory
+   prolog();
+
+#
+# System config can be taken from environmnet variable
+#
+   if( defined($ENV{'saferm_global_conf'}) && -f $ENV{'saferm_global_conf'} ){
+	   # take config from envinment.
+	   $SYS_CONFIG=$ENV{'saferm_global_conf'}; # environment setting is higher priority
+	}
+   if( defined($ENV{'saferm_private_conf'}) && -f $ENV{'saferm_private_conf'} ){
+	   # take config from envinment.
+	   $PRIVATE_CONFIG=$ENV{'saferm_private_conf'}; # environment setting is higher priority
+	}
+
+ 	@ProtectionRegex = ();
+   @ProtectionType = ();
+	my $protected_ownership='root:root'; # imitation of system attaribute -- not yet implemented
+ 	unless(  -f $SYS_CONFIG ){
+	   logme(__LINE__,'W', "No system configuration file $SYS_CONFIG found. The default set of protection regex is used");
+	}
+   slurp_config($SYS_CONFIG);
+
+# Private config, if it exists, adds entries to system config, overiting duplicates
+   if(  -f $PRIVATE_CONFIG ){
+	   slurp_config($PRIVATE_CONFIG);
+	}
+
+#
+# Check what we have now
+#
+my @allowed_args = ();
+
+my (@opt_list,@arg_list);
+my $recursive_mode=0;
+my $forced_mode=0;
+my $verbosity=0;
+#
+# Loop for processing options. Detect if we are used -r -R ot -f. GETOPTS change $ARGV
+#
+my $argno=0; # counter for arguments
+my $optno=0; # counter for options
+   $i=0;
+   while( $i<@ARGV ){
+      $p=$ARGV[$i];
+      if( substr($p,0,1) eq '-' ){
+         # short option or list of options
+         if( substr($p,0,2) eq '--' ){
+            if( $p eq '--recursive' ){
+               $recursive_mode=1;
+            }elsif( $p eq '--help' ){
+               help($verbosity);
+               exit;
+
+            }elsif( $p eq '--debug' ){
+               $debug=1;
+               $i++;
+               next;
+            }
+         } else {
+            if( index($p,'r')>-1 || index($p,'R') > -1 ){
+               $recursive_mode=1;
+            }
+            if( ($pos=index($p,'I'))>-1 ){
+               if ($RmVersion<=5) {
+                  if( length($p)>2 ){
+                     substr($p,$pos,1)=''; # need to delete I from list of options
+                  }else{
+                     next; # option specifies separatly, as -I can be skipped.
+                  }
+               }
+            }
+            # forced option
+            if( index($p,'f') > -1 ){
+              $forced_mode=1;
+            }
+
+            if( index($p,'v') > -1 ){
+              $verbosity=1;
+            }
+
+            if( $p =~/-(\d+)/ ){
+               $upper_limit=$1; # this is the way to set the upper limits
+               $i++;
+               next;  # This is  internal option
+            }
+
+         } # if '--'
+         $opt_list[$optno++]=$p;
+         $i++;
+         next;
+      } # if '-'
+
+      $arg_list[$argno]=$p;
+      $argno++;
+      $i++;
+   } # for
+
+
+   if( scalar(@arg_list)==0 ){
+      abend(__LINE__,"No arguments to process. Exiting...");
+   }
+   if( $recursive_mode==1 && $forced_mode==0 && scalar(@arg_list)>1 ){
+       logme(__LINE__,'S', "More then one argument with recursive option specified. That's a dangerious command");
+       abend(__LINE__,"Can't continue");
+   }
+   @master_list=();
+   for($i=0; $i<@arg_list; $i++ ){
+      if( $arg eq '..' ) {
+         logme(__LINE__,'S',"Expansion of arguments includes parent directry ( .. )  ");
+         $NoExec=1;
+      }
+      if( substr($arg_list[$i],0,1) ne '/' ){
+          $arg=$PWD.'/'.$arg_list[$i];
+      }else{
+         $arg=$arg_list[$i];
+      }
+      if ( -l $arg) {
+         if ( -d $arg ) {
+            logme(__LINE__,'W',"Symbolic link to the directory $arg is detected among the list of arguments");
+         }
+         push(@master_list,$arg);
+      }else{
+         unless ( -e $arg ){
+            logme(__LINE__,'S', "Argument $arg does not exist");
+            exit;
+         }
+         if( -d $arg ){
+            @flist=`tree --noreport -afi $arg`; # tree allows to get list of files and directories to be deleted without traversing symlinks
+            push(@master_list,@flist);
+         }else{
+            push(@master_list,$arg); # presumably file or device
+         }
+      }
+   } # for
+   $total=scalar(@master_list);
+   if( $total>$upper_limit ){
+      logme(__LINE__,'W',"Number or files/directories to be deleted is $total, while the limit was set to $upper_limit. Please specify upper limit as option -$total");
+      $NoExec=1;
+   } else {
+      logme(0,' ',"We will be deleting $total files and directories");
+   }
+   $window_size=7;
+   if ($total > $window_size ){
+      for ($i=0;$i<$window_size;$i++ ){
+         chomp($master_list[$i]);
+         logme(0,' ',"\t[$i] ".$master_list[$i]);
+      }
+      print "\t... ... ...\n";
+      $low_bound=$total-3;
+      if( $low_bound > $window_size ) {
+
+         for( $i=$low_bound; $i<$total; $i++ ){
+            chomp($master_list[$i]);
+            logme(0,' ',"\t[$i] ".$master_list[$i]);
+         }
+      }
+   }
+
+my @blocked=();
+my @triggered=();
+my ($pathname,$NormalizedPathname);
+#
+# main loop -- checking  file  against the  list of regular expressions
+#
+   for( $i=0; $i<@master_list; $i++ ){
+      $name=$master_list[$i];
+      if (($k=index($name,' ->'))>-1){
+         $name=substr($name,0,$k); # tree list symbolic links in full.
+      }
+      chomp($name);
+      $NormalizedPath='';
+      if(  -l $name  ){
+         if ( -d $name) {
+            chomp($symlink=`ls -l $name`);
+            logme(__LINE__,'W',"$name  is a symbolic link to a directory: $symlink");
+         }
+         $NormalizedPath=$name; # realpath() does not work for symlinks.  here we have problems with .. and //
+         $NormalizedType='l';
+      } else {
+         if(  -f $name  ){
+            # this is a file
+            $NormalizedPath=realpath($name);
+            $NormalizedType='f';
+            $dir = substr($NormalizedPath,0,rindex($NormalizedPath,'/'));
+            if(  -l $dir  ){
+               chomp($symlink=`ls -l $dir`);
+               logme(__LINE__,'W',"Directory $dir for the file $name is a symbolic link: $symlink");
+            }
+         } elsif(  -d $name  ){
+            # Convert to an absolute path (e.g. remove "..")
+            $NormalizedPath=realpath($name); # for directory realpath() return absolute path to the directory
+            $NormalizedType='d';
+         }
+      }
+      check_regex();
+   } # for
+   # end of main loop
+   for ($k=0; $k<@triggered; $k++ ){
+      if( defined($triggered[$k]) && $triggered[$k]>0 ){
+         if ($ProtectionType[$k] eq 'p' ) {
+            logme(__LINE__,'S',"Detected $triggered[$k] attempt(s) to remove protected object(s) defined by prefix string  No. $k -- '$ProtectionRegex[$k]'");
+         }else{
+            logme(__LINE__,'S',"Detected $triggered[$k] attempt(s) to remove protected object(s) of type $ProtectionType[$k] defined by regex  No. $k -- '$ProtectionRegex[$k]'");
+         }
+         if( length ($blocked[$k])> 256) {
+            logme(0,' ',"Truncated to 256 bytes list of affected files/directories:".substr($blocked[$k],1,256));
+         } else {
+            logme(0,' ','The list of affected files/directories:'.substr($blocked[$k],1) );
+         }
+      }
+   } #for
+
+   $severe_errors=summary();
+   if( $severe_errors>0 || $NoExec==1 ){
+     chomp($fname="$LOG_DIR/rm_filelist_".`date +"%y%m%d_%H%M"`);
+     open(SYSOUT,">$fname.log") || abend(__LINE__,"Can't open file $fname.log for writing");
+     logme(0, ' ', "\tCowardly refusing to delete $total files.");
+     logme(0, ' ',"\tFull list of files that would be deleted by this rm command was written to $fname.log It can be edited and run via xargs");
+	  for( $i=0; $i<@master_list; $i++ ){
+		  print SYSOUT $master_list[$i];
+	  }
+     exit 1
+   }
+   #
+   # No severe errora of dangerious conditions detected.  Prepare for actually deleting the file(s)
+   #
+   if( $RmVersion > 5 ){
+      $command=' -v -I --one-file-system ';
+   }else{
+      # rm version 5.97 in RHEL5 does not support option -I. It needs to be imitated.
+      $command=' -v ';
+   }
+   $command.=join(' ',@opt_list).' '.join(' ',@arg_list);
+   logme(0,' ',"GENERATED COMMAND:\n\t $RM $command");
+   if( $debug>0 ){
+     exit $TopSeverity;
+   }
+#
+# Actual command execution
+#
+   if( $RmVersion <= 5 && $total > 3 && $forced_mode==0 ){
+      # imitate -I option for older rm...
+      print ("\nrm: remove $total arguments? (Please cancel within 10 sec if not)\n");
+      sleep 10;
+   }
+   $rc=system($RM.$command);
+   if( $rc>0 ){
+     logme(__LINE__,'S',"/bin/rm returned rc=$rc");
+   }
+   exit $rc;
+
+#
+# Standard subroutines
+#
+
+#
+# This detect the first match for a given files. a an p types are checked first.
+# In the future ProtectionRegex array should be sorted and only relent part compared.
+# if is clear that if type of the object mismatch all regex with this type will fail so index can be increased to the last member of the group.
+sub check_regex
+{
+my ($full_match,$t,$f);
+     #
+     # Non-typed matching
+     #
+     for ( $k=0; $k<@ProtectionRegex; $k++ ){
+        $f=$ProtectionRegex[$k];
+        $t=$ProtectionType[$k];
+        $full_match=0;
+        if( $t eq 'a' && $NormalizedPath=~/$f/){
+           $full_match=1;
+        }elsif( $t eq 'p' && length($f)<=length($NormalizedPath) && substr($NormalizedPath,0,length($f)) eq $f ){
+           $full_match=1;
+        }
+        if ($full_match) {
+            $blocked[$k].=', '. $NormalizedPath;
+            $triggered[$k]++;
+            return;
+         }
+     }
+     #
+     # Type based matching
+     #
+   for ( $k=0; $k<@ProtectionRegex; $k++ ){
+        $f=$ProtectionRegex[$k];
+        $t=$ProtectionType[$k];
+        if( $NormalizedType eq $t && $NormalizedPath=~/$f/ ){
+            # record the full_match
+            $blocked[$k].=', '. $NormalizedPath;
+            $triggered[$k]++;
+            last;
+        }
+   } # for ($k=0;
+}
+sub prolog
+{
+   chomp($RM=`which --skip-alias rm`); # aliases are not active in non-interactive sessions, but still.
+   $RmVersion=`$RM --version  | grep 'coreutils' | cut -d ' ' -f 4`;
+   $RmVersion=substr($RmVersion,0,1);
+   chomp($TREE=`which tree`);
+   unless( -f $TREE ){
+       abend(__LINE__,"Looks like utility 'tree' is not installed. Please run 'yum install tree' or equivalent to install this dependency");
+   }
+}
+sub slurp_config
+{
+my $id;
+my $filename = shift;
+my $write_sys=0;
+   $CountParsedRecords=0; # this is global a variable that is changed in parse_record
+   if( -e $filename ){
+      if(  open($SYSIN, '<', $filename)  ){
+         while (<$SYSIN> ){
+           next if(substr($_,0,1) eq '#'); # Comments
+           next if (/^\s*$/); # skip empty lines
+           parse_record($_);
+         }
+         close $SYSIN;    # deliberatly ignore errors
+      }elsif( $filename eq $SYS_CONFIG ){
+        # only for sysconfig
+        logme(__LINE__,'W',"Could not open configuration file: $filename. Default are used\n");
+      }
+
+   }elsif( $filename eq $SYS_CONFIG ){
+      chomp($id=`id -u`);
+      if( $id==0 ){
+         if( open(SYSOUT,'>',$SYS_CONFIG) ){
+            $write_sys=1;
+         }else{
+            logme(__LINE__,'W',"Can't open $SYS_CONFIG for writing while running as root");
+            abend(__LINE__,"Can't continue doe to permissions errors");
+         }
+      }
+      while( <DATA> ){
+         ($write_sys) && print SYSOUT; # write the record of SYS_CONFIG to /etc/saferm.cond or file defined in ENV.
+         next if( substr($_,0,1) eq '#' );
+         next if (/^\s*$/);
+         $rc=parse_record($_);
+         if( $rc>0 ){
+            logme(__LINE__,'E', "Line skipped. Configuration is not complete and results might ne unpredictable");
+            $NoExec=1;
+            if ($write_sys) { $write_sys=2;}
+         }
+      }
+      if ($write_sys) {
+        close SYSOUT;
+        if ($write_sys==2 ) {
+            `mv $SYS_CONFIG $SYS_CONFIG`; # do not write parcially incorrect set fo records.
+            logme(__LINE__,'E', "INTERNAL ERROR system config is incomplete and it was moved to to /etc/saferm.config.parcial. Please correct manually");
+        }
+        if ( -f $SYS_CONFIG ){
+           logme(__LINE__,'W', "$SYS_CONFIG was created from ".scalar(@ProtectionRegex)." default entries. You can edit it later to suit your system");
+        }else{
+           logme(__LINE__,'S', "$SYS_CONFIG was not  created. Possible permissions error. Please investigate ");
+        }
+      }
+
+   }
+   return;
+}
+sub parse_record
+{
+my $rbr=0;
+my $sbr=0;
+my $cbr=0;
+   chomp $_[0];
+my ($regex,$type)=split(/\s+/,$_[0]);
+   unless($type =~/[adflp]/ && length($type)==1  ){
+      logme(__LINE__,'E', "Can't detect valid file type $type in the line $CountParsedRecords containing '$_[0]'. Should be a,d,f,l, or p");
+      return 1;
+   }
+   $ProtectionRegex[$CountParsedRecords] = $regex;
+   $ProtectionType[$CountParsedRecords] = $type;
+   $CountParsedRecords++;
+   for( my $m=0;$m<length($regex);$m++ ){
+      $s=substr($regex,$m,1);
+      if( $s eq '(' ){ $rbr++ }
+      elsif( $s eq '[' ){ $sbr++ }
+      elsif( $s eq '{') { $cbr++ }
+      elsif( $s eq ')') { $rbr-- }
+      elsif( $s eq ']') { $sbr-- }
+      elsif( $s eq '}') { $cbr-- }
+   }
+
+   if( $rbr !=0 ){
+      logme(__LINE__,'W', "Line $. --  There might be non balanced round brackets in regex $regex");
+   }elsif( $sbr !=0 ){
+      logme(__LINE__,'W', "Line $. --  There might be  non balanced square brackets in regex $regex");
+   }elsif( $cbr !=0 ){
+      logme(__LINE__,'W', "Line $. -- There might be  non balanced curvy brackets in regex $regex");
+   }
+   return 0
+}
+
+#================================================================
+# Standard subroutines -- version 3.00 (Dec 11, 2014)
+#================================================================
+
+#
+# Read script and extract help from comments starting with #::  Accets one paremter -- verbosity
+#
+sub help
+{
+   open(SYSHELP,"<$0");
+   while($line=<SYSHELP> ){
+      if(  substr($line,0,3) eq "#::"  ){
+         print substr($line,3);
+      }
+   } # for
+   close SYSHELP;
+# if -v was specified list default regex
+   if( $_[0] > 0 ){
+      print "\nThe default list of protection regex\n\n";
+      while( <DATA> ){
+         print;
+      }
+   }
+   exit;
+}
+
+sub abend
+{
+my $lineno=$_[0];
+my $message=$_[1];
+#
+# Check if log was opened
+#
+   logme($lineno,'T',$message);
+   close SYSLOG;
+   exit;
+} # abend
+#
+# Banner perform thrre fucntions
+# 1. Cleans LOG_DIR
+# 2. opens SYSLOG
+# 3. print the banner message
+#
+sub banner {
+my @files_in_base_dir;
+my $run_mode='';
+   if( $debug > 0 ){
+      $run_mode="DEBUG MODE $debug";
+   }
+chomp(my $log_stamp=`date "+%y%m%d_%H%M"`);
+my $LOG_FILE="$LOG_DIR/$HOSTNAME\_$SCRIPT_NAME\_$log_stamp.log";
+my $title=uc($SCRIPT_NAME)." -- rm wrapper $run_mode (Ver $VERSION) Log is at $LOG_DIR/$HOSTNAME/. Type --help for help.";
+my $MAX_LOGS_IN_BASE=$_[0];
+
+   @files_in_base_dir=`ls -1 $LOG_DIR/*.log`;
+   if( @files_in_base_dir > $MAX_LOGS_IN_BASE ){
+     #Note: in debugging script home dir is your home dir and the last thing you want is to clean it ;-)
+     for (my $i=$MAX_LOGS_IN_BASE; $i<@files_in_base_dir; $i++) {
+         chomp($files_in_base_dir[$i]);
+         unlink($files_in_base_dir[$i]);
+     }
+   }
+   open(SYSLOG, ">$LOG_FILE") || abend(__LINE__,"Fatal error: unable to open $LOG_FILE");
+   if( $Msglevel1==0  ){
+      # do not write bannet with msglevel1==0
+      return unless ( -z $LOG_FILE); # Write banner only at the beginning ofthe log
+   }
+   logme(-1,'','');
+   logme(0,' ',$title);
+   logme(0,' ',"=" x 80);
+}
+#
+# Message generator: Record message in log and STDIN (controlled by msglevel1 and msglevel2)
+# lineno, severity, message
+# NOTE: $TopSeverity, $Msglevel1, $msflevel2 are global variables. Should be initialized elsewhere
+## ARG1 lineno
+# Arg2 Error code (only first letter is used, subsequnt letter can contin assitional info)
+# Arg3 Test of the message
+sub logme
+{
+#our $TopSeverity; -- should be defined globally
+my $lineno=$_[0];
+#
+# Two special cases -- lineno==0 and lineno is negative
+#
+   if( $lineno < 0  ){
+      #interpreted as skip no;
+      print SYSLOG "\n" x (-$lineno);
+     ($Msglevel1>0) && print "\n" x (-$lineno);
+      return;
+   }
+my $error_code=substr($_[1],0,1);
+my $message=$_[2];
+   if( $lineno==0 ){
+      # special message - no timestamp. Used for banner and options printing
+      ($Msglevel1>0) && print "$message\n";
+      print SYSLOG "$message\n";
+      return;
+   }
+
+   my $severity=index("DIWEST",$error_code);
+
+   return if(  $severity == 0 && $debug==0 ); # no need to process debug messages if $debug==0
+   $ErCountParsedRecordser[$severity]++;
+   $message="\[$error_code$lineno\] $message";
+
+#----------------- Error history -------------------------
+   if(  $severity > $TopSeverity ){
+      $TopSeverity=$severity;
+      $TopMessage = $message;
+   }
+#--------- Message printing and logging --------------
+   return if( $severity==0 && $debug==0); # do not print testing messages
+   if ($severity==4) {
+      print SYSLOG "\n======= ATTENTION ======================================\n";
+      print "\n=== ATTENTION ======================================\n";
+   }
+
+   if( $severity > 3-$Msglevel2  ){
+      # msglevel2 defines writing to SYSLOG. 3 means Errors (Severe and terminal messages always should be printed)
+      print SYSLOG "$message\n";
+   }
+   if( $severity > 3-$Msglevel1 ){
+      # msglevel2 defines writing to STDIN. 3 means Errors (Severe and terminal messages always should be printed)
+      print "$message\n";
+   }
+} #logme
+#
+# Summary od diagnostic messages like in IBM compilers
+# Uses globals @ErCountParsedRecordser, $TopSeverity and $TopMessage;
+#
+sub summary {
+   my $i;
+   return 0 if( $TopSeverity<2); # if no warning -- no summary
+   logme(-2,'','');
+   logme(0,' ', '=' x 80);
+   logme(0,' ', "MESSAGES SUMMARY:\n");
+   for ( $i=$TopSeverity; $i>0; $i--  ){
+      next unless( defined($ErCountParsedRecordser[$i]) );
+      next if( $ErCountParsedRecordser[$i] == 0 );
+      print "\tNumber of generated diagnostic messages of severity ".substr('DIWEST',$i,1).": ".$ErCountParsedRecordser[$i]."\n";
+   }
+   print "\tThe most severe error: $TopMessage\n";
+   return ($ErCountParsedRecordser[4]); # return severe errors
+
+} # summary
+#
+# Make directories for the package
+#
+sub mkdirs
+{
+   foreach (@_ ){
+      next if(  -e $_);
+      `mkdir -p $_`;
+   }
+}
+sub max
+{
+   return ($_[0]>$_[1])?$_[0]:$_[1];
+}
+__DATA__
+#
+# TYPES OF CHECKS
+#
+# a -- absolute protection using supplied prefix; type of object does not matter (for example, it can be iether link or directory)
+# p -- prefix string (similar to "a" but fixed string full_matching is used). Like "a" applied to all types of the objects.
+# d -- Protected only if full_match is a directory.
+# f -- protected only if the full_match is a file
+# l -- protected only if the full_match is a link
+#
+# 1: All level 2 directories
+^/\w+$                                    d
+
+# 2: All files in /boot are protected via fixed string prefix
+/boot/                                    p
+
+# 3: All files and directory in /dev are protected via fixed string prefix
+/dev/                                     p
+
+# 4: /root/bin and root/.ssh directorories (directories only)
+^/root($|/bin$|.ssh$)'                    d
+
+# 5: dot files in root
+/root/.bash                               p
+
+# 6: Files directly in /etc, not in subdirectories
+^/etc/(\w+.*($|\.conf))                   f
+
+# 7: Subdirectories of /etc including .d .daily directories such as profile.d yum.d
+^/etc($|/w+|/\w+.d)                       d
+
+# 8: Home directories (directories only, not the content; they should be removed with userdel not rm
+^/home/\w+/$                              d
+
+# 9: Dot files and files in .ssh directory
+^/home/\w+/(\.ssh|\.bash)                 f
+
+# 10: Proc directory
+^/proc($|/)                               a
+
+# 11: Links introduced in RHEL7
+^/bin$|^/sbin$|^/lib$|^lib64$             l
+
+# 12: /sys
+^/sys$'                                   a
+
+# 13: Subdirectories in /usr are protected
+^/usr($|\w+)                              d
+
+# 14: subdirectories of /var
+^/var($|\w+)                              d
+
+# 15: log file
+^/var/log/messages                        f
+
+#
+# Example if site customatization
+#
+
+# 16: subdirectories in Apps
+^/Apps($|\w+/$)                           d
+
+# 17: Subdiretories in Scratch
+^/Scratch($|/\w+/$)'                      d
+
+# 18: .ssh directories on any level of nesting
+^.*/\.ssh$                                 d
