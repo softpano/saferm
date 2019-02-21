@@ -34,14 +34,14 @@
 #:: The following types of regex are currently supported
 #::
 #::    a -- absolute protection using supplied prefix; type of object does not matter (for example, it can be iether link or directory)
-#::    p -- prefix string (similar to "a" but fixed string matching is used). Like "a" applies to all types of objects.
-#::    d -- Protected only if match is a directory.
-#::    f -- protected only if the match is a file
-#::    l -- protected only if the match is a link
+#::    p -- prefix string (similar to "a" but fixed string full_matching is used). Like "a" applies to all types of objects.
+#::    d -- Protected only if full_match is a directory.
+#::    f -- protected only if the full_match is a file
+#::    l -- protected only if the full_match is a link
 #::
 #:: Those locations can be changed via environment variable saferm_global_config and saferm_local_config
 #::
-#:: This utility creates the list of files to be deleted and then analise them one-by-one matching against a set of rules specifed as Perl regex
+#:: This utility creates the list of files to be deleted and then analise them one-by-one full_matching against a set of rules specifed as Perl regex
 #::    -- If no rules are violated it generate and executes rm command with three additional options --one-filesystem, -I and -v
 #::    -- If recursive key is given only one argument is accepted for safety reasons. Also rm command is generated but not executed.
 #::
@@ -80,7 +80,7 @@ use Cwd 'realpath';
    $Msglevel1=5; # level of messages in print
    $Msglevel2=3; # level of message in log (only S,E, and W messages )
    $TopSeverity=0;
-   @ErCounter=(0,0,0,0,0);
+   @ErCountParsedRecordser=(0,0,0,0,0);
 
    $HOME=$ENV{'HOME'};
    $BASE=$HOME.'/Saferm';
@@ -128,7 +128,7 @@ my @allowed_args = ();
 my (@opt_list,@arg_list);
 my $recursive_mode=0;
 my $forced_mode=0;
-my $verbosity=0
+my $verbosity=0;
 #
 # Loop for processing options. Detect if we are used -r -R ot -f. GETOPTS change $ARGV
 #
@@ -248,7 +248,7 @@ my $optno=0; # counter for options
 
 my @blocked=();
 my @triggered=();
-my ($pathname,$normalized_pathname);
+my ($pathname,$NormalizedPathname);
 #
 # main loop -- checking  file  against the  list of regular expressions
 #
@@ -258,70 +258,31 @@ my ($pathname,$normalized_pathname);
          $name=substr($name,0,$k); # tree list symbolic links in full.
       }
       chomp($name);
-      $normalized_path='';
+      $NormalizedPath='';
       if(  -l $name  ){
          if ( -d $name) {
             chomp($symlink=`ls -l $name`);
             logme(__LINE__,'W',"$name  is a symbolic link to a directory: $symlink");
          }
-         $normalized_path=$name; # realpath() does not work for symlinks.  here we have problems with .. and //
+         $NormalizedPath=$name; # realpath() does not work for symlinks.  here we have problems with .. and //
+         $NormalizedType='l';
       } else {
          if(  -f $name  ){
             # this is a file
-            $normalized_path=realpath($name);
-            $dir = substr($normalized_path,0,rindex($normalized_path,'/'));
+            $NormalizedPath=realpath($name);
+            $NormalizedType='f';
+            $dir = substr($NormalizedPath,0,rindex($NormalizedPath,'/'));
             if(  -l $dir  ){
                chomp($symlink=`ls -l $dir`);
                logme(__LINE__,'W',"Directory $dir for the file $name is a symbolic link: $symlink");
             }
          } elsif(  -d $name  ){
             # Convert to an absolute path (e.g. remove "..")
-            $normalized_path=realpath($name); # for directory realpath() return absolute path to the directory
+            $NormalizedPath=realpath($name); # for directory realpath() return absolute path to the directory
+            $NormalizedType='d';
          }
       }
-
-      #
-      # Inner loop: Check against the blacklist using typee. Operated on $normalized_path which should be defined above
-      #
-      for ($k=0; $k<@ProtectionRegex; $k++ ){
-         $f=$ProtectionRegex[$k];
-         $t=$ProtectionType[$k];
-         if ($t eq 'p') {
-            # prefix string
-            if(substr($normalized_path,0,length($f)) eq $f ){
-               $blocked[$k].=', '. $normalized_path;
-               $triggered[$k]++;
-            }
-         }
-         next unless $normalized_path=~/$f/;
-		   if( $t eq 'a' ){
-            $blocked[$k].=', '. $normalized_path;
-            $triggered[$k]++;
-            next;
-         }
-
-         #
-         # Symlinks should be checked first
-         #
-         if(  -l $normalized_path ){
-            if( $t eq 'l' ){
-               $blocked[$k].=', '. $normalized_path;
-               $triggered[$k]++;
-               next;
-            }
-         } else {
-		      if( -f $normalized_path  && $t eq 'f' ){
-               $blocked[$k].=', '. $normalized_path;
-               $triggered[$k]++;
-               next;
-            }elsif(  -d $normalized_path  && $t eq 'd' ){
-               $blocked[$k].=', '. $normalized_path;
-               $triggered[$k]++;
-               next;
-            }
-         }
-
-      } # for ($k=0;
+      check_regex();
    } # for
    # end of main loop
    for ($k=0; $k<@triggered; $k++ ){
@@ -370,9 +331,61 @@ my ($pathname,$normalized_pathname);
 #
 # Standard subroutines
 #
+sub check_regex
+{
+my ($full_match,$t,$f);
+     #
+     # Non-typed matching
+     #
+     for ( $k=0; $k<@ProtectionRegex; $k++ ){
+        $f=$ProtectionRegex[$k];
+        $t=$ProtectionType[$k];
+        $full_match=0;
+        if( $t eq 'a' && $NormalizedPath=~/$f/){
+           $full_match=1;
+        }elsif( $t eq 'p' && length($f)<=length($NormalizedPath) && substr($NormalizedPath,0,length($f)) eq $f ){
+           $full_match=1;
+        }
+        if ($full_match) {
+            $blocked[$k].=', '. $NormalizedPath;
+            $triggered[$k]++;
+         }
+     }
+     #
+     # Type based matching
+     #
+     for ( $k=0; $k<@ProtectionRegex; $k++ ){
+        $f=$ProtectionRegex[$k];
+        $t=$ProtectionType[$k];
+        #if ($k==5 && index($NormalizedPath,'conf') > -1 ) {
+        #    print "$NormalizedPath\n";
+        #}
+        if( $NormalizedType eq $t && $NormalizedPath=~/$f/ ){
+            #
+            # Symlinks should be checked first
+            #
+            $full_match=0;
+            if(  -l $NormalizedPath ){
+               if( $t eq 'l' ){
+                  $full_match=1;
+               }
+            } else {
+               if( -f $NormalizedPath  && $t eq 'f' ){
+                  $full_match=1;
+               }elsif(  -d $NormalizedPath  && $t eq 'd' ){
+                  $full_match=1
+               }
+            }
+            if ($full_match) {
+               # record the full_match
+               $blocked[$k].=', '. $NormalizedPath;
+               $triggered[$k]++;
+            }
+        }
+      } # for ($k=0;
+}
 sub prolog
 {
-   chomp( $FIND=`which find` );
    chomp($RM =`which rm`);
    if( $debug > 2 ){
       chomp($RM = `which ls`);
@@ -387,7 +400,7 @@ sub slurp_config
 my $id;
 my $filename = shift;
 my $write_sys=0;
-   $Count=0; # this global variable that is changed in parse record
+   $CountParsedRecords=0; # this is global a variable that is changed in parse_record
    if( -e $filename ){
       if(  open($SYSIN, '<', $filename)  ){
          while (<$SYSIN> ){
@@ -415,10 +428,18 @@ my $write_sys=0;
          ($write_sys) && print SYSOUT; # write the record of SYS_CONFIG to /etc/saferm.cond or file defined in ENV.
          next if( substr($_,0,1) eq '#' );
          next if (/^\s*$/);
-         parse_record($_);
+         $rc=parse_record($_);
+         if ($rc>0) {
+            logme(__LINE__,'E', "Line skipped. Configuration is not complete and results might ne unpredictable");
+            $no_exec=1;
+            if ($write_sys) { $write_sys=2;}
+         }
       }
       if ($write_sys) {
         close SYSOUT;
+        if ($white_sys==2 || $debug>0 ) {
+            unlink($SYS_CONFIG);
+        }
         if ( -f $SYS_CONFIG ){
            logme(__LINE__,'W', "$SYS_CONFIG was created from ".scalar(@ProtectionRegex)." default entries. You can edit it later to suit your system");
         }else{
@@ -437,12 +458,12 @@ my $cbr=0;
    chomp $_[0];
 my ($regex,$type)=split(/\s+/,$_[0]);
    unless($type =~/[adflp]/ && length($type)==1  ){
-      logme(__LINE__,'S', "Can't detect valid file type $type in the line $Count containing '$_[0]'. Should be a,d,f,l, or p");
-      abend(__LINE__,"Error in config file. Can't continue");
+      logme(__LINE__,'E', "Can't detect valid file type $type in the line $CountParsedRecords containing '$_[0]'. Should be a,d,f,l, or p");
+      return 1;
    }
-   $ProtectionRegex[$Count] = $regex;
-   $ProtectionType[$Count] = $type;
-   $Count++;
+   $ProtectionRegex[$CountParsedRecords] = $regex;
+   $ProtectionType[$CountParsedRecords] = $type;
+   $CountParsedRecords++;
    for( my $m=0;$m<length($regex);$m++ ){
       $s=substr($regex,$m,1);
       if( $s eq '(' ){ $rbr++ }
@@ -460,6 +481,7 @@ my ($regex,$type)=split(/\s+/,$_[0]);
    }elsif( $cbr !=0 ){
       logme(__LINE__,'W', "Line $. -- There might be  non balanced curvy brackets in regex $regex");
    }
+   return 0
 }
 
 #================================================================
@@ -495,13 +517,9 @@ my $message=$_[1];
 #
 # Check if log was opened
 #
-   if( -f $LOG_FILE ){
-     logme($lineno,'T',$message);
-     close SYSLOG;
-     exit;
-   } else {
-     die("Abend at $lineno. $message");
-   }
+   logme($lineno,'T',$message);
+   close SYSLOG;
+   exit;
 } # abend
 #
 # Banner perform thrre fucntions
@@ -529,7 +547,6 @@ my $MAX_LOGS_IN_BASE=$_[0];
      }
    }
    open(SYSLOG, ">$LOG_FILE") || abend(__LINE__,"Fatal error: unable to open $LOG_FILE");
-   chomp $timestamp;
    if( $Msglevel1==0  ){
       # do not write bannet with msglevel1==0
       return unless ( -z $LOG_FILE); # Write banner only at the beginning ofthe log
@@ -570,7 +587,7 @@ my $message=$_[2];
    my $severity=index("DIWEST",$error_code);
 
    return if(  $severity == 0 && $debug==0 ); # no need to process debug messages if $debug==0
-   $ErCounter[$severity]++;
+   $ErCountParsedRecordser[$severity]++;
    $message="\[$error_code$lineno\] $message";
 
 #----------------- Error history -------------------------
@@ -596,7 +613,7 @@ my $message=$_[2];
 } #logme
 #
 # Summary od diagnostic messages like in IBM compilers
-# Uses globals @ErCounter, $TopSeverity and $TopMessage;
+# Uses globals @ErCountParsedRecordser, $TopSeverity and $TopMessage;
 #
 sub summary {
    my $i;
@@ -605,12 +622,12 @@ sub summary {
    logme(0,' ', '=' x 80);
    logme(0,' ', "MESSAGES SUMMARY:\n");
    for ( $i=$TopSeverity; $i>0; $i--  ){
-      next unless( defined($ErCounter[$i]) );
-      next if( $ErCounter[$i] == 0 );
-      print "\tNumber of generated diagnostic messages of severity ".substr('DIWEST',$i,1).": ".$ErCounter[$i]."\n";
+      next unless( defined($ErCountParsedRecordser[$i]) );
+      next if( $ErCountParsedRecordser[$i] == 0 );
+      print "\tNumber of generated diagnostic messages of severity ".substr('DIWEST',$i,1).": ".$ErCountParsedRecordser[$i]."\n";
    }
    print "\tThe most severe error: $TopMessage\n";
-   return ($ErCounter[4]); # return severe errors
+   return ($ErCountParsedRecordser[4]); # return severe errors
 
 } # summary
 #
@@ -632,10 +649,10 @@ __DATA__
 # TYPES OF CHECKS
 #
 # a -- absolute protection using supplied prefix; type of object does not matter (for example, it can be iether link or directory)
-# p -- prefix string (similar to "a" but fixed string matching is used). Like "a" applied to all types of the objects.
-# d -- Protected only if match is a directory.
-# f -- protected only if the match is a file
-# l -- protected only if the match is a link
+# p -- prefix string (similar to "a" but fixed string full_matching is used). Like "a" applied to all types of the objects.
+# d -- Protected only if full_match is a directory.
+# f -- protected only if the full_match is a file
+# l -- protected only if the full_match is a link
 #
 # 1: All level 2 directories
 ^/\w+$                                    d
